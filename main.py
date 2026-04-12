@@ -61,11 +61,14 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
     fetch_ms = int((time.monotonic() - start) * 1000)
     content = resp.text
 
-    # 提取标题：优先 Jina 返回的 X-Title 头，其次 Markdown 首行 #
+    # 提取标题：优先 Jina X-Title 头 → "Title: xxx" 行 → 首个 # 标题
     title = resp.headers.get("x-title")
     if not title:
         for line in content.split("\n"):
             stripped = line.strip()
+            if stripped.startswith("Title: "):
+                title = stripped[7:].strip()
+                break
             if stripped.startswith("# "):
                 title = stripped[2:].strip()
                 break
