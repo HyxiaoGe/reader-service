@@ -9,4 +9,4 @@ COPY main.py .
 
 EXPOSE 8091
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8091"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8091", "--no-access-log"]
