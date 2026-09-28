@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import logging
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -21,6 +22,8 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client_patch = patch("main.httpx.AsyncClient", return_value=self.client)
         self.client_patch.start()
         self.addCleanup(self.client_patch.stop)
+        main._account_failure = None
+        self.addCleanup(setattr, main, "_account_failure", None)
 
     @staticmethod
     def _status_error(status_code: int) -> httpx.HTTPStatusError:
@@ -56,7 +59,7 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         sleep.assert_awaited_once()
 
     async def test_upstream_auth_does_not_retry(self):
-        for status_code in (401, 403):
+        for status_code in (401, 402, 403):
             with self.subTest(status_code=status_code):
                 self.client.get.reset_mock()
                 self.client.get.side_effect = self._status_error(status_code)
@@ -72,6 +75,39 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(raised.exception.detail["attempts"], 1)
                 self.assertEqual(self.client.get.await_count, 1)
+
+    async def test_account_failure_turns_health_degraded_until_next_success(self):
+        self.assertEqual(await main.health(), {"status": "ok"})
+        self.client.get.side_effect = self._status_error(402)
+
+        with self.assertRaises(HTTPException):
+            await main.read_url(self.url)
+
+        degraded = await main.health()
+        self.assertEqual(degraded.status_code, 503)
+        body = json.loads(degraded.body)
+        self.assertEqual(body["jina_account"]["upstream_status"], 402)
+        self.assertEqual(body["jina_account"]["message"], "Jina Reader 账户余额不足")
+        self.assertNotIn("secret", degraded.body.decode())
+
+        request = httpx.Request("GET", "https://r.jina.ai/https://example.com")
+        self.client.get.side_effect = None
+        self.client.get.return_value = httpx.Response(
+            200, request=request, text="Title: ok\n\nbody"
+        )
+        await main.read_url(self.url)
+        self.assertEqual(await main.health(), {"status": "ok"})
+
+    async def test_page_level_failures_do_not_degrade_health(self):
+        for status_code in (400, 404, 429, 500):
+            with self.subTest(status_code=status_code):
+                self.client.get.side_effect = self._status_error(status_code)
+                with (
+                    patch("main.asyncio.sleep", new=AsyncMock()),
+                    self.assertRaises(HTTPException),
+                ):
+                    await main.read_url(self.url)
+                self.assertEqual(await main.health(), {"status": "ok"})
 
     async def test_rate_limit_retries_once(self):
         self.client.get.side_effect = [

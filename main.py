@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Reader Service")
@@ -36,6 +37,12 @@ JINA_MIN_RETRY_WINDOW = max(
 )
 JINA_MAX_ATTEMPTS = 2
 GOOGLE_FAVICON_API = "https://www.google.com/s2/favicons?sz=32&domain="
+# Jina 账户级失败（密钥失效/余额不足）：换哪个网页都读不了，需要人处理
+ACCOUNT_FAILURE_STATUSES = (401, 402, 403)
+
+# 最近一次读取暴露的账户级故障；/health 据此报 503 让哨兵告警，下次读取成功即清除。
+# 只在真实读取时更新，健康检查本身不调用 Jina、不消耗额度。
+_account_failure: dict | None = None
 
 
 class ReadResponse(BaseModel):
@@ -109,8 +116,30 @@ def _raise_reader_error(*, status_code: int, domain: str, detail: dict) -> None:
     raise HTTPException(status_code=status_code, detail=detail) from None
 
 
+def _set_account_failure(upstream_status: int | None, message: str) -> None:
+    global _account_failure
+    if upstream_status in ACCOUNT_FAILURE_STATUSES:
+        _account_failure = {
+            "upstream_status": upstream_status,
+            "message": message,
+            "since": _account_failure["since"]
+            if _account_failure
+            else time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+
+
+def _clear_account_failure() -> None:
+    global _account_failure
+    _account_failure = None
+
+
 @app.get("/health")
 async def health():
+    if _account_failure:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "jina_account": _account_failure},
+        )
     return {"status": "ok"}
 
 
@@ -178,6 +207,10 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
                 error_kind = "upstream_auth"
                 error_message = "Jina Reader 上游鉴权失败"
                 error_retryable = False
+            elif upstream_status == 402:
+                error_kind = "upstream_auth"
+                error_message = "Jina Reader 账户余额不足"
+                error_retryable = False
             elif upstream_status == 429:
                 error_status = 503
                 error_kind = "rate_limited"
@@ -210,6 +243,7 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
             await asyncio.sleep(min(JINA_RETRY_BACKOFF, remaining))
             continue
 
+        _set_account_failure(upstream_status, error_message)
         detail = _error_detail(
             kind=error_kind,
             message=error_message,
@@ -220,6 +254,7 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
         )
         _raise_reader_error(status_code=error_status, domain=domain, detail=detail)
 
+    _clear_account_failure()
     fetch_ms = int((_monotonic() - start) * 1000)
     content = resp.text
     logger.info(
