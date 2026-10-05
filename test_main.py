@@ -24,6 +24,11 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.client_patch.stop)
         main._account_failure = None
         self.addCleanup(setattr, main, "_account_failure", None)
+        main._tavily_account_failure = None
+        self.addCleanup(setattr, main, "_tavily_account_failure", None)
+        tavily_key_patch = patch("main.TAVILY_API_KEY", "")
+        tavily_key_patch.start()
+        self.addCleanup(tavily_key_patch.stop)
 
     @staticmethod
     def _status_error(status_code: int) -> httpx.HTTPStatusError:
@@ -425,6 +430,131 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail["kind"], "timeout")
         self.assertEqual(raised.exception.detail["attempts"], 1)
         self.assertEqual(self.client.get.await_count, 1)
+
+    @staticmethod
+    def _tavily_response(results: list, status_code: int = 200) -> httpx.Response:
+        request = httpx.Request("POST", main.TAVILY_EXTRACT_URL)
+        return httpx.Response(
+            status_code, json={"results": results, "failed_results": []}, request=request
+        )
+
+    @staticmethod
+    def _jina_success(text: str = "# Jina 标题\n正文") -> httpx.Response:
+        request = httpx.Request("GET", "https://r.jina.ai/https://example.com")
+        return httpx.Response(200, text=text, request=request)
+
+    async def test_tavily_success_skips_jina(self):
+        self.client.post.return_value = self._tavily_response(
+            [{"url": self.url, "title": "Tavily 标题", "raw_content": "正文内容"}]
+        )
+
+        with patch("main.TAVILY_API_KEY", "tvly-test"):
+            response = await main.read_url(self.url)
+
+        self.assertEqual(response.provider, "tavily")
+        self.assertEqual(response.content, "正文内容")
+        self.assertEqual(response.title, "Tavily 标题")
+        self.assertEqual(response.attempts, 1)
+        self.client.get.assert_not_awaited()
+        call = self.client.post.await_args
+        self.assertEqual(call.args[0], main.TAVILY_EXTRACT_URL)
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer tvly-test")
+        self.assertEqual(call.kwargs["json"]["urls"], [self.url])
+        self.assertEqual(call.kwargs["json"]["extract_depth"], "basic")
+
+    async def test_tavily_without_title_uses_first_heading(self):
+        self.client.post.return_value = self._tavily_response(
+            [{"url": self.url, "raw_content": "# 页面标题\n正文"}]
+        )
+
+        with patch("main.TAVILY_API_KEY", "tvly-test"):
+            response = await main.read_url(self.url)
+
+        self.assertEqual(response.title, "页面标题")
+
+    async def test_tavily_empty_content_falls_back_to_jina(self):
+        for results in ([], [{"url": self.url, "raw_content": "  "}]):
+            with self.subTest(results=results):
+                self.client.post.reset_mock()
+                self.client.get.reset_mock()
+                self.client.post.return_value = self._tavily_response(results)
+                self.client.get.return_value = self._jina_success()
+
+                with (
+                    patch("main.TAVILY_API_KEY", "tvly-test"),
+                    self.assertLogs("reader_service", level=logging.WARNING) as logs,
+                ):
+                    response = await main.read_url(self.url)
+
+                self.assertEqual(response.provider, "jina")
+                self.assertEqual(response.title, "Jina 标题")
+                self.assertEqual(response.attempts, 2)
+                self.assertEqual(self.client.get.await_count, 1)
+                joined = "\n".join(logs.output)
+                self.assertIn("reader_tavily_fallback", joined)
+                self.assertIn("kind=empty_content", joined)
+                self.assertNotIn("secret", joined)
+
+    async def test_tavily_errors_fall_back_to_jina(self):
+        errors = {
+            "timeout": httpx.ReadTimeout("超时"),
+            "upstream_error": self._status_error(500),
+            "request_error": httpx.ConnectError("连不上"),
+        }
+        for kind, exc in errors.items():
+            with self.subTest(kind=kind):
+                self.client.post.reset_mock()
+                self.client.get.reset_mock()
+                self.client.post.side_effect = exc
+                self.client.get.return_value = self._jina_success()
+
+                with (
+                    patch("main.TAVILY_API_KEY", "tvly-test"),
+                    self.assertLogs("reader_service", level=logging.WARNING) as logs,
+                ):
+                    response = await main.read_url(self.url)
+
+                self.assertEqual(response.provider, "jina")
+                self.assertIn(f"kind={kind}", "\n".join(logs.output))
+                self.assertEqual(await main.health(), {"status": "ok"})
+
+    async def test_jina_fallback_only_gets_remaining_total_budget(self):
+        self.client.post.side_effect = httpx.ReadTimeout("超时")
+
+        with (
+            patch("main.TAVILY_API_KEY", "tvly-test"),
+            patch("main._monotonic", side_effect=[0.0, 0.0, 18.0, 18.0, 18.0]),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.read_url(self.url)
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(raised.exception.detail["kind"], "timeout")
+        self.assertEqual(raised.exception.detail["attempts"], 1)
+        self.client.get.assert_not_awaited()
+
+    async def test_tavily_account_failure_degrades_health_until_tavily_succeeds(self):
+        self.client.post.side_effect = self._status_error(432)
+        self.client.get.return_value = self._jina_success()
+
+        with patch("main.TAVILY_API_KEY", "tvly-test"):
+            response = await main.read_url(self.url)
+
+        self.assertEqual(response.provider, "jina")
+        degraded = await main.health()
+        self.assertEqual(degraded.status_code, 503)
+        body = json.loads(degraded.body)
+        self.assertEqual(body["tavily_account"]["upstream_status"], 432)
+        self.assertNotIn("jina_account", body)
+
+        self.client.post.side_effect = None
+        self.client.post.return_value = self._tavily_response(
+            [{"url": self.url, "raw_content": "正文"}]
+        )
+        with patch("main.TAVILY_API_KEY", "tvly-test"):
+            await main.read_url(self.url)
+
+        self.assertEqual(await main.health(), {"status": "ok"})
 
     async def test_client_uses_split_timeout_configuration(self):
         request = httpx.Request("GET", "https://r.jina.ai/https://example.com")
