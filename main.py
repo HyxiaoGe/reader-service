@@ -1,6 +1,6 @@
 """
 reader-service — 网页内容读取微服务
-第一阶段：代理 Jina Reader，返回结构化网页内容
+优先 Tavily Extract 读取正文，失败或取不到正文时回退 Jina Reader
 """
 
 import asyncio
@@ -36,6 +36,18 @@ JINA_MIN_RETRY_WINDOW = max(
     float(os.getenv("JINA_MIN_RETRY_WINDOW", "10")),
 )
 JINA_MAX_ATTEMPTS = 2
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+# 号池：逗号分隔的多个 key，轮询使用；兼容单 key 的 TAVILY_API_KEY
+TAVILY_API_KEYS = [
+    key.strip()
+    for key in os.getenv("TAVILY_API_KEYS", os.getenv("TAVILY_API_KEY", "")).split(",")
+    if key.strip()
+]
+# 实测 Tavily p90 约 3s；超过上限就把剩余总预算留给 Jina 回退
+TAVILY_TIMEOUT = float(os.getenv("TAVILY_TIMEOUT", "8"))
+# Tavily 账户级失败按 key 冷却：密钥无效一直停用到重启；额度用完隔天再试
+# （各账户计费周期不同，按天重试最省事且失败很快）；限流短暂冷却。
+TAVILY_KEY_COOLDOWNS = {401: None, 432: 86400.0, 433: 86400.0, 429: 60.0}
 GOOGLE_FAVICON_API = "https://www.google.com/s2/favicons?sz=32&domain="
 # Jina 账户级失败（密钥失效/余额不足）：换哪个网页都读不了，需要人处理
 ACCOUNT_FAILURE_STATUSES = (401, 402, 403)
@@ -53,6 +65,7 @@ class ReadResponse(BaseModel):
     content_length: int
     fetch_ms: int
     attempts: int = 1
+    provider: str = "jina"
 
 
 def _monotonic() -> float:
@@ -77,6 +90,165 @@ async def _fetch_jina(
         response = await client.get(jina_url, headers=headers)
         response.raise_for_status()
         return response
+
+
+def _wall_time() -> float:
+    return time.time()
+
+
+class TavilyKeyPool:
+    """轮询分发 Tavily key；账户级失败的 key 冷却后自动回池，不影响其他 key。"""
+
+    def __init__(self, keys: list[str]):
+        self._keys = list(keys)
+        self._next = 0
+        # key 序号 -> (冷却截止时间，None 表示停用到重启；触发的上游状态码)
+        self._blocked: dict[int, tuple[float | None, int]] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._keys)
+
+    def candidates(self) -> list[tuple[int, str]]:
+        """本次请求可用的 key，从轮询游标开始排列。"""
+        now = _wall_time()
+        total = len(self._keys)
+        ordered = [(self._next + offset) % total for offset in range(total)] if total else []
+        if total:
+            self._next = (self._next + 1) % total
+        available = []
+        for index in ordered:
+            blocked = self._blocked.get(index)
+            if blocked is not None:
+                until, _status = blocked
+                if until is None or until > now:
+                    continue
+                del self._blocked[index]
+            available.append((index, self._keys[index]))
+        return available
+
+    def mark_unavailable(self, index: int, upstream_status: int) -> None:
+        cooldown = TAVILY_KEY_COOLDOWNS[upstream_status]
+        until = None if cooldown is None else _wall_time() + cooldown
+        self._blocked[index] = (until, upstream_status)
+        logger.warning(
+            "reader_tavily_key_unavailable key_index=%s upstream_status=%s "
+            "available=%s total=%s",
+            index + 1,
+            upstream_status,
+            self.available_count(),
+            len(self._keys),
+        )
+
+    def mark_ok(self, index: int) -> None:
+        self._blocked.pop(index, None)
+
+    def available_count(self) -> int:
+        now = _wall_time()
+        return sum(
+            1
+            for index in range(len(self._keys))
+            if index not in self._blocked
+            or (
+                self._blocked[index][0] is not None
+                and self._blocked[index][0] <= now
+            )
+        )
+
+    def health_failure(self) -> dict | None:
+        """所有 key 都不可用时返回告警信息（只含序号和状态码，不含 key）。"""
+        if not self._keys or self.available_count() > 0:
+            return None
+        return {
+            "message": "Tavily 号池全部 key 不可用（密钥无效、额度用完或限流）",
+            "total": len(self._keys),
+            "available": 0,
+            "key_statuses": {
+                str(index + 1): status
+                for index, (_until, status) in sorted(self._blocked.items())
+            },
+        }
+
+
+_tavily_pool = TavilyKeyPool(TAVILY_API_KEYS)
+
+
+async def _fetch_tavily(url: str, api_key: str, timeout: float) -> dict:
+    """单次 Tavily Extract；返回该 URL 的结果，失败或无结果时返回空 dict。"""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            TAVILY_EXTRACT_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"urls": [url], "extract_depth": "basic", "format": "markdown"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return {}
+    return results[0]
+
+
+async def _read_with_tavily(url: str, domain: str) -> tuple[str, str | None] | None:
+    """Tavily 读取成功返回 (正文, 标题)；任何失败都返回 None，交给 Jina 回退。
+
+    账户级失败（密钥无效/额度用完/限流）换下一个 key 重试，这类失败返回很快；
+    超时、5xx、无正文属于页面级失败，换 key 也无济于事，直接回退 Jina。
+    """
+    started_at = _monotonic()
+    deadline = started_at + TAVILY_TIMEOUT
+    reason = "no_available_key"
+    upstream_status = None
+    for index, api_key in _tavily_pool.candidates():
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            reason = "timeout"
+            break
+        try:
+            result = await asyncio.wait_for(
+                _fetch_tavily(url, api_key, remaining), timeout=remaining
+            )
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            reason = "timeout"
+            break
+        except httpx.HTTPStatusError as exc:
+            upstream_status = exc.response.status_code
+            if upstream_status in TAVILY_KEY_COOLDOWNS:
+                reason = "upstream_auth"
+                _tavily_pool.mark_unavailable(index, upstream_status)
+                continue
+            reason = "upstream_error"
+            break
+        except Exception:
+            reason = "request_error"
+            break
+        _tavily_pool.mark_ok(index)
+        content = result.get("raw_content")
+        if isinstance(content, str) and content.strip():
+            title = result.get("title")
+            return content, title if isinstance(title, str) and title.strip() else None
+        reason = "empty_content"
+        break
+    logger.warning(
+        "reader_tavily_fallback domain=%s kind=%s upstream_status=%s duration_ms=%s",
+        domain,
+        reason,
+        upstream_status,
+        max(0, int((_monotonic() - started_at) * 1000)),
+    )
+    return None
+
+
+def _extract_title(content: str, header_title: str | None) -> str | None:
+    """优先上游给的标题 → "Title: xxx" 行 → 首个 # 标题。"""
+    if header_title:
+        return header_title
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("Title: "):
+            return stripped[7:].strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return None
 
 
 def _error_detail(
@@ -135,11 +307,14 @@ def _clear_account_failure() -> None:
 
 @app.get("/health")
 async def health():
-    if _account_failure:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "degraded", "jina_account": _account_failure},
-        )
+    tavily_failure = _tavily_pool.health_failure()
+    if _account_failure or tavily_failure:
+        content: dict = {"status": "degraded"}
+        if _account_failure:
+            content["jina_account"] = _account_failure
+        if tavily_failure:
+            content["tavily_account"] = tavily_failure
+        return JSONResponse(status_code=503, content=content)
     return {"status": "ok"}
 
 
@@ -155,15 +330,44 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
     if parsed.scheme not in ("http", "https") or not parsed.netloc or not hostname:
         raise HTTPException(status_code=422, detail="URL 格式无效")
 
+    start = _monotonic()
+    domain = hostname
+    favicon = f"{GOOGLE_FAVICON_API}{parsed.netloc}"
+
+    # Tavily 尝试计入 attempts；失败后 Jina 只用剩余的总预算
+    tavily_attempts = 0
+    first_budget = JINA_TOTAL_TIMEOUT
+    if _tavily_pool:
+        tavily_attempts = 1
+        extracted = await _read_with_tavily(url, domain)
+        if extracted is not None:
+            content, title = extracted
+            fetch_ms = int((_monotonic() - start) * 1000)
+            logger.info(
+                "reader_read_succeeded domain=%s provider=tavily status=200 "
+                "attempts=1 duration_ms=%s",
+                domain,
+                fetch_ms,
+            )
+            return ReadResponse(
+                url=url,
+                title=_extract_title(content, title),
+                content=content,
+                favicon=favicon,
+                content_length=len(content),
+                fetch_ms=fetch_ms,
+                attempts=1,
+                provider="tavily",
+            )
+        first_budget = JINA_TOTAL_TIMEOUT - (_monotonic() - start)
+
     # 调用 Jina Reader
     jina_url = f"{JINA_BASE_URL}/{url}"
     headers = {"Accept": "text/markdown"}
     if JINA_API_KEY:
         headers["Authorization"] = f"Bearer {JINA_API_KEY}"
 
-    start = _monotonic()
     deadline = start + JINA_TOTAL_TIMEOUT
-    domain = hostname
     attempts = 0
     error_status = 504
     error_kind = "timeout"
@@ -172,14 +376,14 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
     upstream_status = None
 
     while attempts < JINA_MAX_ATTEMPTS:
-        remaining = JINA_TOTAL_TIMEOUT if attempts == 0 else deadline - _monotonic()
+        remaining = first_budget if attempts == 0 else deadline - _monotonic()
         if remaining <= 0:
             detail = _error_detail(
                 kind=error_kind,
                 message=error_message,
                 retryable=error_retryable,
                 upstream_status=upstream_status,
-                attempts=attempts,
+                attempts=attempts + tavily_attempts,
                 started_at=start,
             )
             _raise_reader_error(status_code=error_status, domain=domain, detail=detail)
@@ -249,7 +453,7 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
             message=error_message,
             retryable=error_retryable,
             upstream_status=upstream_status,
-            attempts=attempts,
+            attempts=attempts + tavily_attempts,
             started_at=start,
         )
         _raise_reader_error(status_code=error_status, domain=domain, detail=detail)
@@ -258,36 +462,22 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
     fetch_ms = int((_monotonic() - start) * 1000)
     content = resp.text
     logger.info(
-        "reader_read_succeeded domain=%s status=200 attempts=%s duration_ms=%s",
+        "reader_read_succeeded domain=%s provider=jina status=200 attempts=%s "
+        "duration_ms=%s",
         domain,
-        attempts,
+        attempts + tavily_attempts,
         fetch_ms,
     )
 
-    # 提取标题：优先 Jina X-Title 头 → "Title: xxx" 行 → 首个 # 标题
-    title = resp.headers.get("x-title")
-    if not title:
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("Title: "):
-                title = stripped[7:].strip()
-                break
-            if stripped.startswith("# "):
-                title = stripped[2:].strip()
-                break
-
-    # 提取 favicon
-    domain = parsed.netloc
-    favicon = f"{GOOGLE_FAVICON_API}{domain}"
-
     return ReadResponse(
         url=url,
-        title=title,
+        title=_extract_title(content, resp.headers.get("x-title")),
         content=content,
         favicon=favicon,
         content_length=len(content),
         fetch_ms=fetch_ms,
-        attempts=attempts,
+        attempts=attempts + tavily_attempts,
+        provider="jina",
     )
 
 

@@ -78,7 +78,7 @@ def _failure_from_http_error(exc: error.HTTPError) -> SmokeFailure:
     )
 
 
-def run_smoke() -> int:
+def run_smoke() -> tuple[int, str]:
     query = parse.urlencode({"url": SMOKE_TARGET})
     try:
         with request.urlopen(
@@ -117,12 +117,13 @@ def run_smoke() -> int:
             kind="invalid_attempts",
             upstream_status=None,
         )
-    return attempts
+    provider = payload.get("provider")
+    return attempts, provider if provider in ("tavily", "jina") else "unknown"
 
 
 def main() -> int:
     try:
-        attempts = run_smoke()
+        attempts, provider = run_smoke()
     except SmokeFailure as exc:
         print(
             "reader smoke failed "
@@ -131,7 +132,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"reader smoke passed http_status=200 attempts={attempts}")
+    print(
+        f"reader smoke passed http_status=200 attempts={attempts} provider={provider}"
+    )
     return 0
 
 
