@@ -1,18 +1,21 @@
 """
 reader-service — 网页内容读取微服务
-优先 Tavily Extract 读取正文，失败或取不到正文时回退 Jina Reader
+先直接抓取 HTML 提取正文；不适用时用 Tavily Extract，再失败回退 Jina Reader
 """
 
 import asyncio
 import logging
 import os
 import time
+from typing import Annotated
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from direct_read import read_direct
 
 app = FastAPI(title="Reader Service")
 logger = logging.getLogger("reader_service")
@@ -319,7 +322,10 @@ async def health():
 
 
 @app.get("/read", response_model=ReadResponse)
-async def read_url(url: str = Query(..., description="要读取的网页 URL")):
+async def read_url(
+    url: str = Query(..., description="要读取的网页 URL"),
+    full: Annotated[bool, Query(description="跳过正文提取，返回整页 Markdown")] = False,
+):
     # 校验 URL 格式
     try:
         parsed = urlparse(url)
@@ -334,9 +340,31 @@ async def read_url(url: str = Query(..., description="要读取的网页 URL")):
     domain = hostname
     favicon = f"{GOOGLE_FAVICON_API}{parsed.netloc}"
 
-    # Tavily 尝试计入 attempts；失败后 Jina 只用剩余的总预算
+    # 直接抓取只给正文，导航不会占满调用方的正文窗口；表格、列表类页面可能提取不全，
+    # 调用方需要整页时传 full=true 走原链路。
+    page = None if full else await read_direct(url, domain)
+    if page is not None:
+        fetch_ms = int((_monotonic() - start) * 1000)
+        logger.info(
+            "reader_read_succeeded domain=%s provider=direct status=200 "
+            "attempts=1 duration_ms=%s",
+            domain,
+            fetch_ms,
+        )
+        return ReadResponse(
+            url=url,
+            title=_extract_title(page.content, page.title),
+            content=page.content,
+            favicon=favicon,
+            content_length=len(page.content),
+            fetch_ms=fetch_ms,
+            attempts=1,
+            provider="direct",
+        )
+
+    # Tavily 尝试计入 attempts；直接抓取已花掉的时间同样从 Jina 总预算里扣除
     tavily_attempts = 0
-    first_budget = JINA_TOTAL_TIMEOUT
+    first_budget = JINA_TOTAL_TIMEOUT - (_monotonic() - start)
     if _tavily_pool:
         tavily_attempts = 1
         extracted = await _read_with_tavily(url, domain)

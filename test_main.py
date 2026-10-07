@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi import HTTPException
 
+import direct_read
 import main
 
 
@@ -27,6 +28,10 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         tavily_pool_patch = patch("main._tavily_pool", main.TavilyKeyPool([]))
         tavily_pool_patch.start()
         self.addCleanup(tavily_pool_patch.stop)
+        # 这组用例覆盖 Tavily/Jina 链路；直接读取另见 DirectReadTests。
+        direct_patch = patch("main.read_direct", new=AsyncMock(return_value=None))
+        self.read_direct = direct_patch.start()
+        self.addCleanup(direct_patch.stop)
 
     @staticmethod
     def _status_error(status_code: int) -> httpx.HTTPStatusError:
@@ -431,7 +436,7 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.get.side_effect = httpx.ReadTimeout("超时")
 
         with (
-            patch("main._monotonic", side_effect=[0.0, 18.0, 18.0]),
+            patch("main._monotonic", side_effect=[0.0, 0.0, 18.0, 18.0]),
             patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -446,7 +451,7 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.get.side_effect = httpx.ReadTimeout("慢请求超时")
 
         with (
-            patch("main._monotonic", side_effect=[0.0, 8.1, 8.1, 8.1, 8.1]),
+            patch("main._monotonic", side_effect=[0.0, 0.0, 8.1, 8.1, 8.1, 8.1]),
             patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -465,7 +470,7 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.client.get.side_effect = [httpx.ReadTimeout("第一次超时"), success]
 
         with (
-            patch("main._monotonic", side_effect=[0.0, 7.8, 18.01, 18.02]),
+            patch("main._monotonic", side_effect=[0.0, 0.0, 7.8, 18.01, 18.02]),
             patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -483,7 +488,7 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
             200, text="过期结果", request=request
         )
 
-        with patch("main._monotonic", side_effect=[0.0, 18.01, 18.02, 18.03]):
+        with patch("main._monotonic", side_effect=[0.0, 0.0, 18.01, 18.02, 18.03]):
             with self.assertRaises(HTTPException) as raised:
                 await main.read_url(self.url)
 
@@ -579,12 +584,22 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(f"kind={kind}", "\n".join(logs.output))
                 self.assertEqual(await main.health(), {"status": "ok"})
 
+    async def test_direct_read_time_is_deducted_from_jina_budget(self):
+        # 第二个时间点是直接读取结束：已用完总预算时不再请求 Jina
+        with patch("main._monotonic", side_effect=[0.0, 18.0, 18.0, 18.0]):
+            with self.assertRaises(HTTPException) as raised:
+                await main.read_url(self.url)
+
+        self.assertEqual(raised.exception.detail["kind"], "timeout")
+        self.read_direct.assert_awaited_once()
+        self.client.get.assert_not_awaited()
+
     async def test_jina_fallback_only_gets_remaining_total_budget(self):
         self.client.post.side_effect = httpx.ReadTimeout("超时")
 
         with (
             patch("main._tavily_pool", main.TavilyKeyPool(["tvly-test"])),
-            patch("main._monotonic", side_effect=[0.0, 0.0, 0.0, 18.0, 18.0, 18.0]),
+            patch("main._monotonic", side_effect=[0.0, 0.0, 0.0, 0.0, 18.0, 18.0, 18.0]),
         ):
             with self.assertRaises(HTTPException) as raised:
                 await main.read_url(self.url)
@@ -732,6 +747,189 @@ class ReaderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(timeout.read, 10)
         self.assertGreaterEqual(main.JINA_MIN_RETRY_WINDOW, 10)
         self.assertLess(main.JINA_TOTAL_TIMEOUT, 20)
+
+
+
+ARTICLE_HTML = (
+    "<html><head><title>测试文章标题</title>"
+    '<meta property="og:site_name" content="测试站">'
+    '<meta property="article:published_time" content="2026-10-01T08:00:00+08:00">'
+    "</head><body>"
+    "<nav>" + "".join(f'<a href="/c/{i}">栏目{i}</a>' for i in range(200)) + "</nav>"
+    "<article><h1>测试文章标题</h1>"
+    + "".join(
+        f"<p>第{i}段正文：铁路部门预计今日发送旅客两千万人次，热门方向余票紧张，建议旅客合理安排出行时间并使用候补购票功能。</p>"
+        for i in range(8)
+    )
+    + "</article><footer>版权所有</footer></body></html>"
+)
+
+
+class DirectReadTests(unittest.IsolatedAsyncioTestCase):
+    """直接读取：只连 DoH 核验过的公网 IP，每一跳重新核验，任何不满足都回退。"""
+
+    def setUp(self):
+        self.dns = {"news.example.com": ["93.184.216.34"]}
+        self.pages = {}
+        self.requests = []
+        real_client = httpx.AsyncClient
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if request.url.host == "223.5.5.5":
+                name = request.url.params["name"]
+                rtype = request.url.params["type"]
+                answers = [
+                    {"type": 28 if ":" in ip else 1, "data": ip}
+                    for ip in self.dns.get(name, [])
+                    if (":" in ip) == (rtype == "AAAA")
+                ]
+                return httpx.Response(200, json={"Answer": answers})
+            key = (request.headers["host"], request.url.path)
+            return self.pages.get(key) or httpx.Response(404, text="missing")
+
+        def make_client(*args, **kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        client_patch = patch("direct_read.httpx.AsyncClient", side_effect=make_client)
+        client_patch.start()
+        self.addCleanup(client_patch.stop)
+
+    def _html(self, host: str, path: str, body: str = ARTICLE_HTML, **headers):
+        self.pages[(host, path)] = httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/html; charset=utf-8", **headers}
+        )
+
+    def _page_requests(self):
+        return [r for r in self.requests if r.url.host != "223.5.5.5"]
+
+    async def test_extracts_article_via_pinned_public_ip(self):
+        self._html("news.example.com", "/a")
+
+        page = await direct_read.read_direct("https://news.example.com/a?x=1#frag", "news.example.com")
+
+        self.assertIsNotNone(page)
+        self.assertIn("第0段正文", page.content)
+        self.assertNotIn("栏目199", page.content)
+        self.assertEqual(page.title, "测试文章标题")
+        [request] = self._page_requests()
+        self.assertEqual(request.url.host, "93.184.216.34")
+        self.assertEqual(request.url.query, b"x=1")
+        self.assertEqual(request.headers["host"], "news.example.com")
+        self.assertEqual(request.extensions["sni_hostname"], "news.example.com")
+
+    async def test_private_dns_answer_is_not_fetched(self):
+        self.dns["news.example.com"] = ["192.168.1.11"]
+        self._html("news.example.com", "/a")
+
+        page = await direct_read.read_direct("https://news.example.com/a", "news.example.com")
+
+        self.assertIsNone(page)
+        self.assertEqual(self._page_requests(), [])
+
+    async def test_any_private_record_rejects_host(self):
+        self.dns["news.example.com"] = ["93.184.216.34", "10.0.0.5"]
+        self._html("news.example.com", "/a")
+
+        self.assertIsNone(await direct_read.read_direct("https://news.example.com/a", "d"))
+        self.assertEqual(self._page_requests(), [])
+
+    async def test_clash_fake_ip_range_is_not_trusted(self):
+        self.dns["news.example.com"] = ["198.18.1.15"]
+
+        self.assertIsNone(await direct_read.read_direct("https://news.example.com/a", "d"))
+        self.assertEqual(self._page_requests(), [])
+
+    async def test_private_ip_literal_skips_dns_and_fetch(self):
+        self.assertIsNone(await direct_read.read_direct("http://192.168.1.11/admin", "d"))
+        self.assertIsNone(await direct_read.read_direct("http://[::1]/admin", "d"))
+        self.assertEqual(self.requests, [])
+
+    async def test_redirect_to_private_host_is_rejected(self):
+        self.dns["internal.example.com"] = ["127.0.0.1"]
+        self.pages[("news.example.com", "/a")] = httpx.Response(
+            302, headers={"location": "http://internal.example.com/secret"}
+        )
+        self._html("internal.example.com", "/secret")
+
+        self.assertIsNone(await direct_read.read_direct("https://news.example.com/a", "d"))
+        self.assertEqual([r.url.path for r in self._page_requests()], ["/a"])
+
+    async def test_redirect_to_public_host_is_verified_again(self):
+        self.dns["www.example.org"] = ["93.184.216.35"]
+        self.pages[("news.example.com", "/a")] = httpx.Response(
+            301, headers={"location": "https://www.example.org/b"}
+        )
+        self._html("www.example.org", "/b")
+
+        page = await direct_read.read_direct("https://news.example.com/a", "d")
+
+        self.assertIsNotNone(page)
+        resolved = [r.url.params["name"] for r in self.requests if r.url.host == "223.5.5.5"]
+        self.assertIn("www.example.org", resolved)
+        self.assertEqual(self._page_requests()[-1].url.host, "93.184.216.35")
+
+    async def test_redirect_loop_gives_up(self):
+        self.pages[("news.example.com", "/a")] = httpx.Response(302, headers={"location": "/a"})
+
+        self.assertIsNone(await direct_read.read_direct("https://news.example.com/a", "d"))
+        self.assertEqual(len(self._page_requests()), direct_read.DIRECT_READ_MAX_REDIRECTS + 1)
+
+    async def test_non_default_port_and_credentials_are_skipped(self):
+        self.assertIsNone(await direct_read.read_direct("https://news.example.com:8443/a", "d"))
+        self.assertIsNone(await direct_read.read_direct("https://u:p@news.example.com/a", "d"))
+        self.assertEqual(self.requests, [])
+
+    async def test_non_html_error_status_and_short_text_fall_back(self):
+        self.pages[("news.example.com", "/pdf")] = httpx.Response(
+            200, content=b"%PDF", headers={"content-type": "application/pdf"}
+        )
+        self.pages[("news.example.com", "/blocked")] = httpx.Response(
+            403, text="<html>Enable JavaScript</html>", headers={"content-type": "text/html"}
+        )
+        self._html("news.example.com", "/short", "<html><body><p>Enable JavaScript and cookies</p></body></html>")
+
+        for path in ("/pdf", "/blocked", "/short"):
+            with self.subTest(path=path):
+                self.assertIsNone(await direct_read.read_direct(f"https://news.example.com{path}", "d"))
+
+    async def test_oversized_body_is_abandoned(self):
+        self._html("news.example.com", "/big")
+        with patch("direct_read.DIRECT_READ_MAX_BYTES", 1024):
+            self.assertIsNone(await direct_read.read_direct("https://news.example.com/big", "d"))
+
+    async def test_disabled_flag_makes_no_requests(self):
+        with patch("direct_read.DIRECT_READ_ENABLED", False):
+            self.assertIsNone(await direct_read.read_direct("https://news.example.com/a", "d"))
+        self.assertEqual(self.requests, [])
+
+    async def test_read_url_uses_direct_result_and_skips_providers(self):
+        self._html("news.example.com", "/a")
+        with patch("main._tavily_pool", main.TavilyKeyPool(["tvly-test"])), patch(
+            "main._read_with_tavily", new=AsyncMock()
+        ) as tavily, patch("main._fetch_jina", new=AsyncMock()) as jina:
+            response = await main.read_url("https://news.example.com/a")
+
+        self.assertEqual(response.provider, "direct")
+        self.assertEqual(response.attempts, 1)
+        self.assertEqual(response.title, "测试文章标题")
+        tavily.assert_not_awaited()
+        jina.assert_not_awaited()
+
+    async def test_full_mode_skips_direct_read(self):
+        self._html("news.example.com", "/a")
+        with patch("main._tavily_pool", main.TavilyKeyPool(["tvly-test"])), patch(
+            "main._read_with_tavily", new=AsyncMock(return_value=("# 整页\n导航 正文", "整页"))
+        ) as tavily:
+            response = await main.read_url("https://news.example.com/a", full=True)
+
+        self.assertEqual(response.provider, "tavily")
+        tavily.assert_awaited_once()
+        self.assertEqual(self.requests, [])
+
+    def test_container_ships_direct_read_module(self):
+        dockerfile = Path(__file__).with_name("Dockerfile").read_text()
+        self.assertIn("direct_read.py", dockerfile)
 
 
 if __name__ == "__main__":
